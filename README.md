@@ -1,0 +1,1 @@
+# Char_recgn_NN_ZenteiQ
