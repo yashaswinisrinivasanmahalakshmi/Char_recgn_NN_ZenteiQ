@@ -1,1 +1,620 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix, classification_report
+import seaborn as sns
+import os
+import struct
+from PIL import Image, ImageDraw, ImageFont
 
+# Set random seed for reproducibility
+np.random.seed(42)
+
+
+# ============================================================
+# SECTION 1: DATA PREPARATION
+# ============================================================
+
+class DataGenerator:
+    """
+    Generates a synthetic dataset of uppercase letters (A-Z) and digits (1-9).
+
+    Uses PIL to render characters with various fonts, sizes, and slight
+    translations to create diversity. Produces at least 50 samples per class.
+
+    Attributes:
+        classes (list): List of 35 class labels ('A'-'Z', '1'-'9')
+        img_size (int): Target square image dimension (default 28)
+        samples_per_class (int): Number of samples to generate per class
+    """
+
+    def __init__(self, img_size=28, samples_per_class=50):
+        self.img_size = img_size
+        self.samples_per_class = samples_per_class
+        self.classes = [chr(c) for c in range(ord('A'), ord('Z') + 1)] + \
+                       [str(d) for d in range(1, 10)]
+        self.class_to_idx = {c: i for i, c in enumerate(self.classes)}
+
+    def _get_fonts(self):
+        """
+        Attempts to load available system fonts. Falls back to PIL default.
+
+        Returns:
+            list: List of PIL ImageFont objects
+        """
+        font_paths = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",
+            "C:/Windows/Fonts/arial.ttf",
+        ]
+        fonts = []
+        for fp in font_paths:
+            if os.path.exists(fp):
+                for size in [16, 20, 24]:
+                    try:
+                        fonts.append(ImageFont.truetype(fp, size))
+                    except Exception:
+                        pass
+        if not fonts:
+            fonts = [ImageFont.load_default()]
+        return fonts
+
+    def _render_char(self, char, font):
+        """
+        Renders a character onto a small image with random jitter.
+
+        Args:
+            char (str): Character to render
+            font (ImageFont): Font to use
+
+        Returns:
+            np.ndarray: Flattened, normalized image vector (img_size^2,)
+        """
+        # Render on larger canvas first for better quality
+        canvas_size = 64
+        img = Image.new('L', (canvas_size, canvas_size), color=0)
+        draw = ImageDraw.Draw(img)
+
+        # Random offset for augmentation
+        dx = np.random.randint(-3, 4)
+        dy = np.random.randint(-3, 4)
+
+        try:
+            bbox = draw.textbbox((0, 0), char, font=font)
+            w = bbox[2] - bbox[0]
+            h = bbox[3] - bbox[1]
+        except Exception:
+            w, h = canvas_size // 2, canvas_size // 2
+
+        pos = ((canvas_size - w) // 2 + dx, (canvas_size - h) // 2 + dy)
+        draw.text(pos, char, fill=255, font=font)
+
+        # Resize to target and normalize
+        img = img.resize((self.img_size, self.img_size), Image.LANCZOS)
+        arr = np.array(img, dtype=np.float32) / 255.0
+        return arr.flatten()
+
+    def generate(self):
+        """
+        Generates the full dataset.
+
+        Returns:
+            X (np.ndarray): Shape (N, img_size^2) of normalized pixel values
+            y (np.ndarray): Shape (N,) integer class labels
+        """
+        fonts = self._get_fonts()
+        X, y = [], []
+        for char in self.classes:
+            idx = self.class_to_idx[char]
+            for i in range(self.samples_per_class):
+                font = fonts[i % len(fonts)]
+                vec = self._render_char(char, font)
+                X.append(vec)
+                y.append(idx)
+        return np.array(X), np.array(y)
+
+
+def train_val_test_split(X, y, val_ratio=0.15, test_ratio=0.15):
+    """
+    Splits data into train/validation/test sets with stratification.
+
+    Ensures each class is represented proportionally in all splits.
+
+    Args:
+        X (np.ndarray): Feature matrix (N, D)
+        y (np.ndarray): Labels (N,)
+        val_ratio (float): Fraction for validation
+        test_ratio (float): Fraction for test
+
+    Returns:
+        tuple: (X_train, y_train, X_val, y_val, X_test, y_test)
+    """
+    n = len(y)
+    indices = np.arange(n)
+
+    # Stratified split
+    train_idx, val_idx, test_idx = [], [], []
+    for c in np.unique(y):
+        c_idx = indices[y == c]
+        np.random.shuffle(c_idx)
+        n_c = len(c_idx)
+        n_val = int(n_c * val_ratio)
+        n_test = int(n_c * test_ratio)
+        val_idx.extend(c_idx[:n_val])
+        test_idx.extend(c_idx[n_val:n_val + n_test])
+        train_idx.extend(c_idx[n_val + n_test:])
+
+    train_idx = np.array(train_idx)
+    val_idx = np.array(val_idx)
+    test_idx = np.array(test_idx)
+
+    return (X[train_idx], y[train_idx],
+            X[val_idx], y[val_idx],
+            X[test_idx], y[test_idx])
+
+
+# ============================================================
+# SECTION 2: NEURAL NETWORK FROM SCRATCH (NumPy only)
+# ============================================================
+
+class NeuralNetwork:
+    """
+    Fully-connected feedforward neural network implemented from scratch.
+
+    Architecture:
+        Input -> [Linear -> ReLU] * (L-1) -> Linear -> Softmax
+
+    Training uses mini-batch gradient descent with cross-entropy loss.
+    All gradients are derived analytically and computed via NumPy only.
+
+    Attributes:
+        layer_sizes (list): Sizes of each layer [D, h1, h2, ..., C]
+        activation (str): Hidden activation — 'relu' or 'tanh'
+        params (dict): Weight and bias parameters 'W1','b1','W2',...
+        cache (dict): Forward pass cache for backpropagation
+    """
+
+    def __init__(self, layer_sizes, activation='relu', weight_init='he'):
+        """
+        Args:
+            layer_sizes (list): e.g. [784, 128, 64, 35]
+            activation (str): 'relu' or 'tanh'
+            weight_init (str): 'he' for ReLU, 'xavier' for tanh
+        """
+        self.layer_sizes = layer_sizes
+        self.activation = activation
+        self.params = {}
+        self.cache = {}
+        self._init_weights(weight_init)
+
+    def _init_weights(self, scheme):
+        """
+        Initializes weights and biases.
+
+        He init:    W ~ N(0, sqrt(2/n_in))   — best for ReLU
+        Xavier init: W ~ N(0, sqrt(1/n_in))   — best for tanh
+
+        Args:
+            scheme (str): Initialization scheme name
+        """
+        for i in range(len(self.layer_sizes) - 1):
+            n_in = self.layer_sizes[i]
+            n_out = self.layer_sizes[i + 1]
+            if scheme == 'he':
+                std = np.sqrt(2.0 / n_in)
+            else:
+                std = np.sqrt(1.0 / n_in)
+            self.params[f'W{i + 1}'] = np.random.randn(n_in, n_out) * std
+            self.params[f'b{i + 1}'] = np.zeros((1, n_out))
+
+    # ---------------- Activation functions ----------------
+    @staticmethod
+    def _relu(z):
+        """ReLU activation: max(0, z). Fast, avoids vanishing gradients for z>0."""
+        return np.maximum(0, z)
+
+    @staticmethod
+    def _relu_grad(z):
+        """ReLU derivative: 1 if z > 0 else 0."""
+        return (z > 0).astype(z.dtype)
+
+    @staticmethod
+    def _tanh(z):
+        """Tanh activation: squashes to (-1, 1), zero-centered."""
+        return np.tanh(z)
+
+    @staticmethod
+    def _tanh_grad(z):
+        """Tanh derivative: 1 - tanh(z)^2."""
+        return 1.0 - np.tanh(z) ** 2
+
+    @staticmethod
+    def _softmax(z):
+        """
+        Numerically stable softmax (subtract max per row).
+
+        Args:
+            z (np.ndarray): Logits (N, C)
+        Returns:
+            np.ndarray: Probabilities (N, C), rows sum to 1
+        """
+        z = z - np.max(z, axis=1, keepdims=True)
+        exp_z = np.exp(z)
+        return exp_z / np.sum(exp_z, axis=1, keepdims=True)
+
+    @staticmethod
+    def _cross_entropy(probs, y_true):
+        """
+        Categorical cross-entropy loss.
+
+        L = -1/N * sum_i log(p[i, y_i])
+
+        Args:
+            probs (np.ndarray): Predicted probabilities (N, C)
+            y_true (np.ndarray): Integer labels (N,)
+        Returns:
+            float: Scalar loss
+        """
+        N = probs.shape[0]
+        eps = 1e-12
+        correct_logprobs = -np.log(probs[np.arange(N), y_true] + eps)
+        return np.mean(correct_logprobs)
+
+    def _apply_activation(self, z):
+        """Applies the configured hidden activation."""
+        return self._relu(z) if self.activation == 'relu' else self._tanh(z)
+
+    def _apply_activation_grad(self, z):
+        """Applies the derivative of the configured hidden activation."""
+        return self._relu_grad(z) if self.activation == 'relu' else self._tanh_grad(z)
+
+    # ---------------- Forward propagation ----------------
+    def forward(self, X, training=True):
+        """
+        Forward propagation through all layers.
+
+        For each hidden layer l:
+            Z_l = A_{l-1} @ W_l + b_l
+            A_l = activation(Z_l)
+        Output layer uses softmax to produce class probabilities.
+
+        Args:
+            X (np.ndarray): Input batch (N, D)
+            training (bool): If True, cache intermediate values for backprop
+        Returns:
+            np.ndarray: Class probabilities (N, C)
+        """
+        A = X
+        L = len(self.layer_sizes) - 1
+        if training:
+            self.cache = {'A0': X}
+
+        for i in range(1, L + 1):
+            W = self.params[f'W{i}']
+            b = self.params[f'b{i}']
+            Z = A @ W + b
+            if training:
+                self.cache[f'Z{i}'] = Z
+            if i < L:
+                A = self._apply_activation(Z)
+            else:
+                A = self._softmax(Z)  # output layer
+            if training:
+                self.cache[f'A{i}'] = A
+        return A
+
+    # ---------------- Backpropagation ----------------
+    def backward(self, y_true):
+        """
+        Backpropagation using the chain rule.
+
+        Gradient derivations:
+            dZ_L = A_L - onehot(y)              (softmax + CE combined)
+            dW_l = A_{l-1}^T @ dZ_l / N
+            db_l = sum(dZ_l) / N
+            dA_{l-1} = dZ_l @ W_l^T
+            dZ_{l-1} = dA_{l-1} * activation'(Z_{l-1})
+
+        Args:
+            y_true (np.ndarray): Integer labels (N,)
+        Returns:
+            dict: Gradients keyed 'dW1','db1',...
+        """
+        N = y_true.shape[0]
+        L = len(self.layer_sizes) - 1
+        grads = {}
+
+        # Output layer gradient: dZ_L = probs - one_hot
+        A_L = self.cache[f'A{L}']
+        dZ = A_L.copy()
+        dZ[np.arange(N), y_true] -= 1.0
+        dZ /= N
+
+        # Backprop through layers
+        for i in range(L, 0, -1):
+            A_prev = self.cache[f'A{i - 1}']
+            grads[f'dW{i}'] = A_prev.T @ dZ
+            grads[f'db{i}'] = np.sum(dZ, axis=0, keepdims=True)
+
+            if i > 1:
+                W = self.params[f'W{i}']
+                dA_prev = dZ @ W.T
+                dZ = dA_prev * self._apply_activation_grad(self.cache[f'Z{i - 1}'])
+
+        return grads
+
+    # ---------------- Training ----------------
+    def train(self, X_train, y_train, X_val, y_val,
+              epochs=100, batch_size=32, lr=0.01,
+              l2_reg=1e-4, verbose=True):
+        """
+        Mini-batch gradient descent training loop.
+
+        Steps per epoch:
+            1. Shuffle training data
+            2. For each mini-batch:
+                a. Forward pass
+                b. Compute loss (+ L2 regularization)
+                c. Backward pass
+                d. Update parameters: W <- W - lr * dW
+            3. Evaluate on validation set
+
+        Args:
+            X_train, y_train: Training data
+            X_val, y_val: Validation data
+            epochs (int): Number of passes over data
+            batch_size (int): Mini-batch size
+            lr (float): Learning rate
+            l2_reg (float): L2 regularization strength
+            verbose (bool): Print progress
+
+        Returns:
+            history (dict): 'train_loss', 'val_loss', 'val_acc' per epoch
+        """
+        N = X_train.shape[0]
+        history = {'train_loss': [], 'val_loss': [], 'val_acc': []}
+
+        for epoch in range(1, epochs + 1):
+            perm = np.random.permutation(N)
+            X_sh, y_sh = X_train[perm], y_train[perm]
+            epoch_loss = 0.0
+            n_batches = 0
+
+            for start in range(0, N, batch_size):
+                Xb = X_sh[start:start + batch_size]
+                yb = y_sh[start:start + batch_size]
+
+                # Forward
+                probs = self.forward(Xb, training=True)
+                loss = self._cross_entropy(probs, yb)
+
+                # L2 regularization
+                l2 = sum(np.sum(self.params[f'W{i}'] ** 2)
+                         for i in range(1, len(self.layer_sizes)))
+                loss += 0.5 * l2_reg * l2
+                epoch_loss += loss
+                n_batches += 1
+
+                # Backward
+                grads = self.backward(yb)
+
+                # Gradient descent update
+                for i in range(1, len(self.layer_sizes)):
+                    self.params[f'W{i}'] -= lr * (grads[f'dW{i}'] +
+                                                  l2_reg * self.params[f'W{i}'])
+                    self.params[f'b{i}'] -= lr * grads[f'db{i}']
+
+            train_loss = epoch_loss / n_batches
+            val_probs = self.forward(X_val, training=False)
+            val_loss = self._cross_entropy(val_probs, y_val)
+            val_acc = self.accuracy(X_val, y_val)
+
+            history['train_loss'].append(train_loss)
+            history['val_loss'].append(val_loss)
+            history['val_acc'].append(val_acc)
+
+            if verbose and (epoch % 10 == 0 or epoch == 1):
+                print(f"Epoch {epoch:3d} | Train Loss: {train_loss:.4f} | "
+                      f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc * 100:.2f}%")
+
+        return history
+
+    # ---------------- Prediction / Evaluation ----------------
+    def predict_proba(self, X):
+        """Returns class probabilities for input X."""
+        return self.forward(X, training=False)
+
+    def predict(self, X):
+        """Returns predicted class indices (argmax of softmax)."""
+        return np.argmax(self.predict_proba(X), axis=1)
+
+    def accuracy(self, X, y):
+        """Computes classification accuracy."""
+        return np.mean(self.predict(X) == y)
+
+
+# ============================================================
+# SECTION 3: ANALYSIS — CONFUSION MATRIX & ERROR ANALYSIS
+# ============================================================
+
+def plot_training_curves(history, save_path='training_curves.png'):
+    """
+    Plots training/validation loss and validation accuracy vs epoch.
+
+    Args:
+        history (dict): Output from NeuralNetwork.train
+        save_path (str): Where to save the figure
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    epochs = range(1, len(history['train_loss']) + 1)
+
+    axes[0].plot(epochs, history['train_loss'], label='Train Loss')
+    axes[0].plot(epochs, history['val_loss'], label='Val Loss')
+    axes[0].set_xlabel('Epoch');
+    axes[0].set_ylabel('Loss')
+    axes[0].set_title('Loss Curves');
+    axes[0].legend();
+    axes[0].grid(True)
+
+    axes[1].plot(epochs, history['val_acc'], color='green', label='Val Accuracy')
+    axes[1].set_xlabel('Epoch');
+    axes[1].set_ylabel('Accuracy')
+    axes[1].set_title('Validation Accuracy');
+    axes[1].legend();
+    axes[1].grid(True)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=120)
+    plt.close()
+    print(f"[INFO] Saved training curves to {save_path}")
+
+
+def plot_confusion_matrix(y_true, y_pred, classes, save_path='confusion_matrix.png'):
+    """
+    Computes and visualizes the confusion matrix as a heatmap.
+
+    Args:
+        y_true (np.ndarray): Ground truth labels
+        y_pred (np.ndarray): Predicted labels
+        classes (list): Class name strings
+        save_path (str): Where to save the figure
+    """
+    cm = confusion_matrix(y_true, y_pred, labels=np.arange(len(classes)))
+    plt.figure(figsize=(14, 12))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=classes, yticklabels=classes,
+                cbar_kws={'label': 'Count'})
+    plt.xlabel('Predicted');
+    plt.ylabel('True')
+    plt.title('Confusion Matrix — Character Recognition NN')
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=120)
+    plt.close()
+    print(f"[INFO] Saved confusion matrix to {save_path}")
+    return cm
+
+
+def analyze_errors(X_test, y_test, model, classes, n=5, img_size=28):
+    """
+    Finds and visualizes the first N misclassified samples.
+
+    For each error, prints true class, predicted class, and confidence.
+    Saves a visualization grid.
+
+    Args:
+        X_test (np.ndarray): Test features
+        y_test (np.ndarray): True labels
+        model (NeuralNetwork): Trained model
+        classes (list): Class names
+        n (int): Number of errors to display
+        img_size (int): Image dimension for reshaping
+    """
+    probs = model.predict_proba(X_test)
+    preds = np.argmax(probs, axis=1)
+    wrong_idx = np.where(preds != y_test)[0]
+
+    if len(wrong_idx) == 0:
+        print("[INFO] No misclassifications found in test set!")
+        return []
+
+    print(f"\n=== Incorrect Predictions Analysis ({len(wrong_idx)} total errors) ===")
+    sample_idx = wrong_idx[:n]
+    errors = []
+
+    fig, axes = plt.subplots(1, n, figsize=(3 * n, 3.5))
+    if n == 1:
+        axes = [axes]
+
+    for ax, idx in zip(axes, sample_idx):
+        true_c = classes[y_test[idx]]
+        pred_c = classes[preds[idx]]
+        conf = probs[idx, preds[idx]]
+        errors.append((true_c, pred_c, conf))
+
+        ax.imshow(X_test[idx].reshape(img_size, img_size), cmap='gray')
+        ax.set_title(f"True: {true_c}\nPred: {pred_c} ({conf:.2f})",
+                     color='red' if true_c != pred_c else 'green')
+        ax.axis('off')
+
+    plt.tight_layout()
+    plt.savefig('error_analysis.png', dpi=120)
+    plt.close()
+    print("[INFO] Saved error analysis grid to error_analysis.png")
+
+    for i, (t, p, c) in enumerate(errors, 1):
+        print(f"  Error #{i}: True={t} | Predicted={p} | Confidence={c:.3f}")
+    return errors
+
+
+# ============================================================
+# SECTION 4: MAIN PIPELINE
+# ============================================================
+
+def main():
+    """End-to-end pipeline: data → split → train → evaluate → analyze."""
+    print("=" * 60)
+    print("CHARACTER RECOGNITION NN FROM SCRATCH (NumPy only)")
+    print("=" * 60)
+
+    # ---- 1. Data Generation ----
+    print("\n[1] Generating synthetic dataset...")
+    gen = DataGenerator(img_size=28, samples_per_class=50)
+    X, y = gen.generate()
+    print(f"    Total samples: {X.shape[0]}, Features: {X.shape[1]}")
+    print(f"    Classes: {len(gen.classes)} -> {gen.classes}")
+
+    # ---- 2. Train/Val/Test Split ----
+    print("\n[2] Splitting into train/val/test...")
+    X_train, y_train, X_val, y_val, X_test, y_test = train_val_test_split(X, y)
+    print(f"    Train: {X_train.shape[0]} | Val: {X_val.shape[0]} | Test: {X_test.shape[0]}")
+
+    # ---- 3. Model Initialization ----
+    print("\n[3] Initializing neural network [784 -> 128 -> 64 -> 35]...")
+    model = NeuralNetwork(
+        layer_sizes=[784, 128, 64, 35],
+        activation='relu',
+        weight_init='he'
+    )
+
+    # ---- 4. Training ----
+    print("\n[4] Training (mini-batch gradient descent)...")
+    history = model.train(
+        X_train, y_train, X_val, y_val,
+        epochs=100, batch_size=32, lr=0.05,
+        l2_reg=1e-4, verbose=True
+    )
+
+    # ---- 5. Evaluation ----
+    print("\n[5] Final Evaluation:")
+    train_acc = model.accuracy(X_train, y_train)
+    val_acc = model.accuracy(X_val, y_val)
+    test_acc = model.accuracy(X_test, y_test)
+    print(f"    Train Accuracy: {train_acc * 100:.2f}%")
+    print(f"    Val   Accuracy: {val_acc * 100:.2f}%")
+    print(f"    Test  Accuracy: {test_acc * 100:.2f}%")
+
+    # ---- 6. Analysis ----
+    print("\n[6] Analysis:")
+    plot_training_curves(history)
+
+    y_pred = model.predict(X_test)
+    plot_confusion_matrix(y_test, y_pred, gen.classes)
+
+    print("\n[6b] Classification Report:")
+    print(classification_report(y_test, y_pred,
+                                labels=np.arange(len(gen.classes)),
+                                target_names=gen.classes, zero_division=0))
+
+    analyze_errors(X_test, y_test, model, gen.classes, n=5)
+
+    # ---- 7. Save model ----
+    np.savez('model_weights.npz', **model.params)
+    print("\n[7] Model parameters saved to model_weights.npz")
+    print("\n" + "=" * 60)
+    print("PIPELINE COMPLETE")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
